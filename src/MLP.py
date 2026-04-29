@@ -21,18 +21,12 @@ def read_data(file_path):
             parts=line.split()
             label=int(parts[0])
             words=parts[1:]
-            #words=["死囚","爱","刽子手"]
-            #把words中每一个词转为50维词向量
-            #要把words转为词向量，这样的话word2vec["爱"]=...
             vectors=[]
             for word in words:
                 if word in word2vec:
                     vectors.append(word2vec[word])
                 else:
                     vectors.append([0.0]*50)
-            #一行文本->label+words->vectors
-            #这个时候，一行的words转成了一个句子长度*50的vector
-            #下一步是把vectors和label转成tensor
             vectors=torch.tensor(vectors,dtype=torch.float)
             label=torch.tensor(label,dtype=torch.long)
             data.append((vectors,label))
@@ -41,20 +35,13 @@ def read_data(file_path):
 
     return data,max_len
 
-
-    #tensor的结构是[句子长度,50]
-    #label原来是一个一维的数，转tensor之后就是一个0维tensor
-    #train_data=[
-    #(vector1,label1),
-    #(vector2,label2),
-    #...
-    #]
-    #其中vector1的shape可能是[34,50]，接下来要padding，把词向量的行补成一致的
-    #padding
 def build_tensor(data,max_len):
     padded_vectors=[]
     padded_labels=[]
+    true_lengths=[]
     for vectors,label in data:
+        #记录每个句子的真实长度，后面做池化时需要忽略padding
+        true_lengths.append(min(vectors.shape[0], max_len))
         if vectors.shape[0]<max_len:
             pad=torch.zeros(max_len-vectors.shape[0],50)
             vectors=torch.cat([vectors,pad],dim=0)
@@ -65,29 +52,19 @@ def build_tensor(data,max_len):
             padded_vectors.append(vectors)
             padded_labels.append(label)
 
-    #pad之后，padded_vectors里面的每一个元素都是[max_len,50]的tensor
-    #stack一下，X是沿一个新的维度把这N个形状相同的二维张量叠起来
-    #X.shape=[N,mex_len,50]
-    #第 0 维：第几个句子
-    #第 1 维：句子里的第几个词位置
-    #第 2 维：这个词向量的 50 个数
     X=torch.stack(padded_vectors)
     y=torch.stack(padded_labels)
-    #X是训练输入
-    #y是训练标签
-    X=X.unsqueeze(1)
-    #X.shape=[N,1,max_len,50]
-    #加一个通道维，把它看成单通道输出
+    true_lengths = torch.tensor(true_lengths, dtype=torch.long)
 
-    return X,y
+    return X,y,true_lengths
 
 train_data, train_max_len = read_data("Dataset/train.txt")
 val_data, _ = read_data("Dataset/validation.txt")
 test_data, _ = read_data("Dataset/test.txt")
 
-X_train, y_train = build_tensor(train_data, train_max_len)
-X_val, y_val = build_tensor(val_data, train_max_len)
-X_test, y_test = build_tensor(test_data, train_max_len)
+X_train, y_train, len_train = build_tensor(train_data, train_max_len)
+X_val, y_val, len_val = build_tensor(val_data, train_max_len)
+X_test, y_test, len_test = build_tensor(test_data, train_max_len)
 
 batch_size = 64
 
@@ -95,66 +72,70 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 X_train = X_train.to(device)
 y_train = y_train.to(device)
+len_train = len_train.to(device)
 X_val = X_val.to(device)
 y_val = y_val.to(device)
+len_val = len_val.to(device)
 X_test = X_test.to(device)
 y_test = y_test.to(device)
+len_test = len_test.to(device)
 
 train_loader = DataLoader(
-    TensorDataset(X_train, y_train),
+    TensorDataset(X_train, y_train, len_train),
     batch_size=batch_size,
     shuffle=True,
 )
 val_loader = DataLoader(
-    TensorDataset(X_val, y_val),
+    TensorDataset(X_val, y_val, len_val),
     batch_size=batch_size,
     shuffle=False,
 )
 test_loader = DataLoader(
-    TensorDataset(X_test, y_test),
+    TensorDataset(X_test, y_test, len_test),
     batch_size=batch_size,
     shuffle=False,
 )
 
-class TextCNN(nn.Module):#所有神经网络的基类，我定义的神经网络要继承它
-    def __init__(self):#初始化函数，也就是创建这个模型对象时，自动执行的函数
-        super(TextCNN,self).__init__()#先把父类 nn.Module 该初始化的东西初始化一下
-        num_filters = 100
-        self.convs = nn.ModuleList([
-            nn.Conv2d(1, num_filters, (2, 50)),
-            nn.Conv2d(1, num_filters, (3, 50)),
-            nn.Conv2d(1, num_filters, (4, 50)),
-        ])
-        self.dropout = nn.Dropout(0.5)
-        #全连接层
-        self.fc=nn.Linear(num_filters * 3,2)#输入300维特征，输出2维，对应二分类的两个类别
-    #前向传播
-    def forward(self,x):
-        conv_outputs = []
-        for conv in self.convs:
-            conv_x = conv(x)
-            conv_x = F.relu(conv_x)
-            conv_x = conv_x.squeeze(3)
-            conv_x = F.max_pool1d(conv_x, conv_x.size(2))
-            conv_x = conv_x.squeeze(2)
-            conv_outputs.append(conv_x)
-        x = torch.cat(conv_outputs, dim=1)
+class TextMLP(nn.Module):
+    def __init__(self):
+        super(TextMLP, self).__init__()
+        #先对每个词向量做MLP映射，再对整句做池化，这样仍然不显式建模词序
+        self.token_fc1 = nn.Linear(50, 128)
+        self.token_fc2 = nn.Linear(128, 128)
+        self.dropout = nn.Dropout(0.3)
+        self.cls_fc1 = nn.Linear(256, 128)
+        self.cls_fc2 = nn.Linear(128, 2)
+
+    def forward(self, x, lengths):
+        x = F.relu(self.token_fc1(x))
         x = self.dropout(x)
-        #全连接层
-        x = self.fc(x)
+        x = F.relu(self.token_fc2(x))
+
+        #构造mask，忽略padding位置
+        mask = (torch.arange(x.size(1), device=x.device).unsqueeze(0) < lengths.unsqueeze(1)).unsqueeze(2)
+
+        #对非padding部分做平均池化和最大池化，再拼接成句向量
+        x_zero = x * mask.float()
+        mean_pool = x_zero.sum(dim=1) / lengths.unsqueeze(1)
+
+        x_masked = x.masked_fill(~mask, float("-inf"))
+        max_pool = x_masked.max(dim=1).values
+
+        x = torch.cat([mean_pool, max_pool], dim=1)
+        x = self.dropout(F.relu(self.cls_fc1(x)))
+        x = self.cls_fc2(x)
         return x
-    
-model=TextCNN().to(device)
+
+model=TextMLP().to(device)
 
 # 损失函数和优化器
-criterion = nn.CrossEntropyLoss()#看模型给两个类别各打了多少分，看真实标签是哪一类，算出loss函数
-optimizer = optim.Adam(model.parameters(), lr=0.001)#根据loss算出来的梯度，去更新模型参数
-
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 # 训练
 min_val_loss=float("inf")
-best_state=None#保存最好的模型参数
-patience=3
+best_state=None
+patience=5
 wait=0
 
 print(f"device={device}")
@@ -165,13 +146,13 @@ for epoch in range(50):
     train_correct = 0
     train_total = 0
 
-    for batch_x, batch_y in train_loader:
-        output = model(batch_x)
+    for batch_x, batch_y, batch_len in train_loader:
+        output = model(batch_x, batch_len)
         loss = criterion(output, batch_y)
 
-        optimizer.zero_grad()#把旧梯度清空
-        loss.backward()#反向传播，计算梯度
-        optimizer.step()#沿这些梯度下降的方向修改
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
         train_loss_sum += loss.item() * batch_y.size(0)
         train_correct += (torch.argmax(output, dim=1) == batch_y).sum().item()
@@ -185,8 +166,8 @@ for epoch in range(50):
     val_correct = 0
     val_total = 0
     with torch.no_grad():
-        for batch_x, batch_y in val_loader:
-            val_output = model(batch_x)
+        for batch_x, batch_y, batch_len in val_loader:
+            val_output = model(batch_x, batch_len)
             val_loss = criterion(val_output, batch_y)
             val_pred = torch.argmax(val_output, dim=1)
 
@@ -197,12 +178,12 @@ for epoch in range(50):
     val_loss_avg = val_loss_sum / val_total
     val_acc = val_correct / val_total
 
-
     print(
         f"epoch {epoch+1}, "
         f"train_loss={train_loss:.4f}, train_acc={train_acc:.4f}, "
         f"val_loss={val_loss_avg:.4f}, val_acc={val_acc:.4f}"
     )
+
     if val_loss_avg < min_val_loss:
         min_val_loss = val_loss_avg
         best_state = copy.deepcopy(model.state_dict())
@@ -220,14 +201,13 @@ if best_state is not None:
 model.eval()
 test_correct = 0
 test_total = 0
-
 tp = 0
 fp = 0
 fn = 0
 
 with torch.no_grad():
-    for batch_x, batch_y in test_loader:
-        test_output = model(batch_x)
+    for batch_x, batch_y, batch_len in test_loader:
+        test_output = model(batch_x, batch_len)
         test_pred = torch.argmax(test_output, dim=1)
 
         test_correct += (test_pred == batch_y).sum().item()
